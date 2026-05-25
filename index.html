@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard Keuangan Premium | AR, AP, PYMHD, UMO</title>
+  <!-- SEO Meta Tags -->
+  <meta name="description" content="Dashboard Keuangan Minimalis dan Elegan untuk manajemen AR, AP, PYMHD, dan UMO dengan visualisasi ringkasan real-time dan impor Excel cerdas.">
+  
+  <!-- FontAwesome Icons & Google Font preconnect -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <!-- Style Sheet -->
+  <link rel="stylesheet" href="css/style.css">
+  
+  <!-- ApexCharts for Glowing Visualizations -->
+  <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+  
+  <!-- SheetJS (XLSX) CDN for parsing spreadsheets in client side -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+
+  <!-- ==========================================
+       SIDEBAR NAVIGATION
+       ========================================== -->
+  <aside class="sidebar" id="appSidebar">
+    <div class="brand-container">
+      <div class="brand-logo">
+        <i class="fa-solid fa-chart-line"></i>
+      </div>
+      <span class="brand-name">FIN-CORE</span>
+    </div>
+    
+    <nav>
+      <ul class="menu-list">
+        <li>
+          <a class="menu-item active" data-view="dashboard" id="menu-dashboard">
+            <i class="fa-solid fa-grid-horizontal"></i>
+            <span>Dashboard</span>
+          </a>
+        </li>
+        <li>
+          <a class="menu-item" data-view="ar" id="menu-ar">
+            <i class="fa-solid fa-file-invoice-dollar"></i>
+            <span>Receivables (AR)</span>
+          </a>
+        </li>
+        <li>
+          <a class="menu-item" data-view="ap" id="menu-ap">
+            <i class="fa-solid fa-file-invoice"></i>
+            <span>Payables (AP)</span>
+          </a>
+        </li>
+        <li>
+          <a class="menu-item" data-view="pymhd" id="menu-pymhd">
+            <i class="fa-solid fa-clock-rotate-left"></i>
+            <span>Accruals (PYMHD)</span>
+          </a>
+        </li>
+        <li>
+          <a class="menu-item" data-view="umo" id="menu-umo">
+            <i class="fa-solid fa-wallet"></i>
+            <span>Advances (UMO)</span>
+          </a>
+        </li>
+      </ul>
+    </nav>
+    
+    <div class="sidebar-footer">
+      <div class="user-avatar" id="avatarName">E</div>
+      <div class="user-info">
+        <span class="user-name">Ekha Dashboard</span>
+        <span class="user-role">Finance Admin</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ==========================================
+       MAIN WORKSPACE
+       ========================================== -->
+  <main class="main-content">
+    
+    <!-- HEADER BAR -->
+    <header class="header">
+      <h1 class="view-title" id="currentViewTitle">Dashboard Ringkasan</h1>
+      <div class="header-actions">
+        <div class="date-indicator" id="dateTimeDisplay">
+          <i class="fa-regular fa-calendar-days"></i>
+          <span id="currentTimeStr">Memuat Waktu...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- CENTRAL CONTENT AREA -->
+    <section id="mainContentArea">
+      <!-- Content is dynamically rendered here by app.js -->
+    </section>
+
+  </main>
+
+  <!-- ==========================================
+       DYNAMIC CRUD INPUT MODAL SHEET
+       ========================================== -->
+  <div class="modal-overlay" id="crudModalOverlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 class="modal-title" id="crudModalTitle">Tambah Data Baru</h2>
+        <button class="modal-close" id="closeCrudModal"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      <form id="crudForm" autocomplete="off">
+        <!-- Dynamic fields are inserted here based on selected menu -->
+        <div class="form-grid" id="crudFormBody">
+          <!-- Populated by JS -->
+        </div>
+        <div class="buttons-group" style="justify-content: flex-end; margin-top: 10px;">
+          <button type="button" class="btn btn-secondary" id="cancelCrudBtn">Batal</button>
+          <button type="submit" class="btn btn-primary" id="saveCrudBtn">Simpan</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       EXCEL / CSV IMPORT MODAL SHEET
+       ========================================== -->
+  <div class="modal-overlay" id="uploadModalOverlay">
+    <div class="modal-content" style="max-width: 600px;">
+      <div class="modal-header">
+        <h2 class="modal-title" id="uploadModalTitle">Impor Data</h2>
+        <button class="modal-close" id="closeUploadModal"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      
+      <!-- Upload Drop Zone (Step 1) -->
+      <div id="uploadStep1">
+        <div class="upload-zone" id="dropZone">
+          <input type="file" id="excelFileInput" accept=".xlsx, .xls, .csv" style="display: none;">
+          <i class="fa-solid fa-file-excel"></i>
+          <p class="upload-zone-text">Seret & lepas berkas Excel / CSV di sini</p>
+          <p class="upload-zone-subtext">atau klik untuk menelusuri berkas dari komputer Anda</p>
+        </div>
+        <div class="buttons-group" style="justify-content: flex-end;">
+          <button type="button" class="btn btn-secondary" id="cancelUploadBtn1">Batal</button>
+        </div>
+      </div>
+
+      <!-- Column Mapping Zone (Step 2) -->
+      <div id="uploadStep2" style="display: none;">
+        <h3 style="font-size: 1rem; margin-bottom: 12px; color: var(--text-muted);">Sesuaikan Kolom Excel Anda dengan Database</h3>
+        <div class="mapping-container" id="columnMappingArea">
+          <!-- Dynamic column mapping list generated by uploader.js -->
+        </div>
+        
+        <!-- Preview parsed count -->
+        <div style="background: rgba(255,255,255,0.02); padding: 12px; border-radius: var(--border-radius-sm); font-size: 0.85rem; margin-bottom: 20px; border: 1px solid var(--border-color);">
+          <i class="fa-solid fa-info-circle" style="color: var(--color-primary); margin-right: 6px;"></i>
+          Total data yang ditemukan: <strong id="parsedRecordsCount" style="color: #fff;">0</strong> baris.
+        </div>
+
+        <div class="buttons-group" style="justify-content: flex-end;">
+          <button type="button" class="btn btn-secondary" id="backToStep1">Kembali</button>
+          <button type="button" class="btn btn-success" id="confirmImportBtn">
+            <i class="fa-solid fa-cloud-arrow-up"></i> Mulai Impor
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       DELETE CONFIRMATION DIALOG
+       ========================================== -->
+  <div class="modal-overlay" id="deleteConfirmOverlay">
+    <div class="modal-content" style="max-width: 400px; padding: 24px;">
+      <h3 style="font-size: 1.15rem; font-weight: 700; color: #fff; margin-bottom: 12px;" id="deleteConfirmTitle">Hapus Data</h3>
+      <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 24px;" id="deleteConfirmMessage">
+        Apakah Anda yakin ingin menghapus data ini? Tindakan ini tidak dapat dibatalkan.
+      </p>
+      <div class="buttons-group" style="justify-content: flex-end;">
+        <button type="button" class="btn btn-secondary" id="cancelDeleteBtn">Batal</button>
+        <button type="button" class="btn btn-danger" id="executeDeleteBtn">Hapus</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       TOAST NOTIFICATION SYSTEM CONTAINER
+       ========================================== -->
+  <div class="toast-container" id="toastContainer">
+    <!-- Toasts generated dynamically by components.js / app.js -->
+  </div>
+
+  <!-- ==========================================
+       JAVASCRIPT APPLICATION ENGINE
+       ========================================== -->
+  <script src="js/uploader.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
