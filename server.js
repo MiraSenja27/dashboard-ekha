@@ -12,7 +12,17 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 // Serve static frontend files
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname));
+
+// Middleware: pastikan DB terkoneksi setiap request (penting untuk Vercel)
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'Gagal konek ke database: ' + err.message });
+  }
+});
 
 // Flag MongoDB connection cache
 let isConnected = false;
@@ -360,17 +370,7 @@ app.delete('/api/:menu', async (req, res) => {
 
 // Catch-All Static Router
 app.get('/*path', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Middleware: pastikan DB terkoneksi setiap request (penting untuk Vercel)
-app.use(async (req, res, next) => {
-  try {
-    await connectDB();
-    next();
-  } catch (err) {
-    res.status(500).json({ error: 'Gagal konek ke database: ' + err.message });
-  }
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 // Jalankan server lokal saja (Vercel tidak butuh ini)
