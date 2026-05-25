@@ -368,8 +368,13 @@ app.delete('/api/:menu', async (req, res) => {
   }
 });
 
-// Catch-All Static Router
+// Catch-All: only for non-file routes
 app.get('/*path', (req, res) => {
+  const reqPath = req.path;
+  // Don't intercept static file requests
+  if (reqPath.includes('.')) {
+    return res.status(404).send('Not found');
+  }
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
