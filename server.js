@@ -11,11 +11,12 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// Serve static frontend files
-app.use(express.static(__dirname));
+// Serve static files - CSS and JS folders
+app.use('/css', express.static(path.join(__dirname, 'css')));
+app.use('/js', express.static(path.join(__dirname, 'js')));
 
-// Middleware: pastikan DB terkoneksi setiap request (penting untuk Vercel)
-app.use(async (req, res, next) => {
+// Middleware: pastikan DB terkoneksi setiap request API (penting untuk Vercel)
+app.use('/api', async (req, res, next) => {
   try {
     await connectDB();
     next();
@@ -368,13 +369,8 @@ app.delete('/api/:menu', async (req, res) => {
   }
 });
 
-// Catch-All: only for non-file routes
-app.get('/*path', (req, res) => {
-  const reqPath = req.path;
-  // Don't intercept static file requests
-  if (reqPath.includes('.')) {
-    return res.status(404).send('Not found');
-  }
+// Serve index.html for root
+app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
