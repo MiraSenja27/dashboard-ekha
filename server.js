@@ -1,627 +1,1166 @@
-const express = require('express');
-const mongoose = require('mongoose');
-const path = require('path');
-const fs = require('fs');
-require('dotenv').config();
-
-const { AR, AP, PYMHD, UMO } = require('./models');
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
+const xlsx = require("xlsx");
+const path = require("path");
+const fs = require("fs");
+const mongoose = require("mongoose");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 
+// Middleware
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+app.use(express.static(__dirname));
 
-// Serve static frontend files
-app.use(express.static(path.join(__dirname, 'public')));
+// ─── Mongoose Schemas ────────────────────────────────────────────────────────
 
-// Flag to track database mode
-let useLocalFallback = false;
+const volumeSchema = new mongoose.Schema({
+  tanggal: { type: String },
+  rute: { type: String },
+  postal: { type: Number, default: 0 },
+  nonPostal: { type: Number, default: 0 },
+  kapasitas: { type: Number, default: 0 },
+  unit: [{ type: String }],
+  category: { type: String, default: "primer" },
+  weekStart: { type: String },
+  weekEnd: { type: String },
+  weekKey: { type: String },
+  uploadTime: { type: String },
+});
 
-// ==========================================
-// FILE-BASED DATABASE FALLBACK ENGINE
-// ==========================================
-class LocalDb {
-  constructor() {
-    this.filePath = path.join(__dirname, 'db_fallback.json');
-    if (!fs.existsSync(this.filePath)) {
-      fs.writeFileSync(this.filePath, JSON.stringify({ ar: [], ap: [], pymhd: [], umo: [] }, null, 2));
+const titikSchema = new mongoose.Schema(
+  {
+    label: String,
+    target: String,
+    realisasi: String,
+    status: String,
+  },
+  { _id: false },
+);
+
+const slaSchema = new mongoose.Schema({
+  nopol: { type: String },
+  rute: { type: String },
+  tanggal: { type: String },
+  titik: [titikSchema],
+  category: { type: String, default: "primer" },
+  weekStart: { type: String },
+  weekEnd: { type: String },
+  weekKey: { type: String },
+  uploadTime: { type: String },
+});
+
+const userSchema = new mongoose.Schema({
+  username: { type: String, unique: true },
+  password: { type: String },
+  role: { type: String, default: "viewer" },
+});
+
+const VolumeData = mongoose.models.VolumeData || mongoose.model("VolumeData", volumeSchema);
+const SlaData = mongoose.models.SlaData || mongoose.model("SlaData", slaSchema);
+const User = mongoose.models.User || mongoose.model("User", userSchema);
+// ─── Connect to MongoDB ───────────────────────────────────────────────────────
+
+// Cache koneksi agar tidak reconnect setiap request di Vercel serverless
+let isConnected = false;
+
+// Migration: convert existing unit strings to arrays (run once on startup)
+async function migrateUnitField() {
+  const docs = await VolumeData.find({ unit: { $type: 'string' } });
+  for (const doc of docs) {
+    if (typeof doc.unit === 'string' && doc.unit.trim() !== '') {
+      const arr = doc.unit.split(',').map(u => u.trim()).filter(u => u);
+      await VolumeData.updateOne({ _id: doc._id }, { $set: { unit: arr } });
     }
   }
+  console.log('✅ Unit field migration completed');
+}
 
-  read() {
-    try {
-      const content = fs.readFileSync(this.filePath, 'utf8');
-      return JSON.parse(content);
-    } catch (e) {
-      return { ar: [], ap: [], pymhd: [], umo: [] };
-    }
+async function connectDB() {
+  // Jika sudah terkoneksi, skip (penting untuk Vercel serverless)
+  if (isConnected && mongoose.connection.readyState === 1) {
+    return;
   }
 
-  write(data) {
-    fs.writeFileSync(this.filePath, JSON.stringify(data, null, 2));
+  if (!process.env.MONGO_URI) {
+    throw new Error('MONGO_URI tidak ditemukan. Tambahkan di Vercel Environment Variables.');
   }
 
-  async find(collection) {
-    const db = this.read();
-    const list = db[collection.toLowerCase()] || [];
-    return [...list].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  }
-
-  async create(collection, item) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    if (!db[colName]) db[colName] = [];
-    
-    const record = {
-      _id: 'local_' + Math.random().toString(36).substring(2, 9),
-      ...item,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-
-    this.calculateFields(colName, record);
-
-    // Unique Constraint check for manual additions
-    const uniqueFields = { ar: 'invoiceNo', ap: 'invoiceNo', pymhd: 'referenceNo', umo: 'umoNo' };
-    const uniqKey = uniqueFields[colName];
-    if (uniqKey && db[colName].some(x => x[uniqKey] === record[uniqKey])) {
-      const err = new Error('Nomor Dokumen sudah terdaftar di database.');
-      err.code = 11000;
-      throw err;
-    }
-
-    db[colName].push(record);
-    this.write(db);
-    return record;
-  }
-
-  // SMART UPSERT FOR LOCAL DB
-  async insertMany(collection, items) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    if (!db[colName]) db[colName] = [];
-
-    const uniqueFields = { ar: 'invoiceNo', ap: 'invoiceNo', pymhd: 'referenceNo', umo: 'umoNo' };
-    const uniqKey = uniqueFields[colName];
-
-    let insertedCount = 0;
-    let updatedCount = 0;
-
-    for (let rawItem of items) {
-      this.calculateFields(colName, rawItem);
-      
-      const existingIdx = db[colName].findIndex(x => x[uniqKey] === rawItem[uniqKey]);
-      
-      if (existingIdx !== -1) {
-        // Update existing record
-        db[colName][existingIdx] = {
-          ...db[colName][existingIdx],
-          ...rawItem,
-          updatedAt: new Date().toISOString()
-        };
-        updatedCount++;
-      } else {
-        // Insert new record
-        const record = {
-          _id: 'local_' + Math.random().toString(36).substring(2, 9),
-          ...rawItem,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
-        db[colName].push(record);
-        insertedCount++;
-      }
-    }
-
-    this.write(db);
-    return { insertedCount, updatedCount };
-  }
-
-  async findByIdAndUpdate(collection, id, updateBody) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    const list = db[colName] || [];
-    const idx = list.findIndex(x => x._id === id);
-    if (idx === -1) throw new Error('Data tidak ditemukan');
-
-    const updated = {
-      ...list[idx],
-      ...updateBody,
-      updatedAt: new Date().toISOString()
-    };
-
-    this.calculateFields(colName, updated);
-    list[idx] = updated;
-    this.write(db);
-    return updated;
-  }
-
-  async findByIdAndDelete(collection, id) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    const list = db[colName] || [];
-    const idx = list.findIndex(x => x._id === id);
-    if (idx === -1) throw new Error('Data tidak ditemukan');
-
-    const deleted = list.splice(idx, 1)[0];
-    this.write(db);
-    return deleted;
-  }
-
-  async deleteMany(collection) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    const count = db[colName] ? db[colName].length : 0;
-    db[colName] = [];
-    this.write(db);
-    return { deletedCount: count };
-  }
-
-  calculateFields(colName, record) {
-    if (colName === 'ar') {
-      record.paidAmount = record.paidAmount || 0;
-      record.amount = record.amount || 0;
-      record.balance = record.amount - record.paidAmount;
-      if (record.balance <= 0) {
-        record.status = 'Paid';
-      } else {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const due = new Date(record.dueDate);
-        due.setHours(0, 0, 0, 0);
-        record.status = due < today ? 'Overdue' : 'Outstanding';
-      }
-    } else if (colName === 'ap') {
-      record.paidAmount = record.paidAmount || 0;
-      record.amount = record.amount || 0;
-      record.balance = record.amount - record.paidAmount;
-      if (record.balance <= 0) {
-        record.status = 'Paid';
-      } else {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const due = new Date(record.dueDate);
-        due.setHours(0, 0, 0, 0);
-        record.status = due < today ? 'Overdue' : 'Unpaid';
-      }
-    } else if (colName === 'pymhd') {
-      record.amount = record.amount || 0;
-      record.status = record.status || 'Accrued';
-    } else if (colName === 'umo') {
-      record.amount = record.amount || 0;
-      record.realizedAmount = record.realizedAmount || 0;
-      record.settlementBalance = record.amount - record.realizedAmount;
-      record.status = record.settlementBalance <= 0 ? 'Settled' : 'Open';
-    }
+  try {
+    await mongoose.connect(process.env.MONGO_URI, {
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+    });
+    isConnected = true;
+    console.log("✅ Database terhubung ke MongoDB");
+    await migrateUnitField();
+    await seedDefaults();
+  } catch (err) {
+    isConnected = false;
+    console.error("❌ Gagal konek ke MongoDB:", err.message);
+    throw err; // Lempar error agar handler API bisa return 500
   }
 }
 
-const localDb = new LocalDb();
-
-// Connect to MongoDB Atlas with Automatic Local Fallback
-mongoose.connect(process.env.MONGO_URI)
-  .then(async () => {
-    console.log('Koneksi ke MongoDB Atlas BERHASIL! 🚀');
-    await seedData(false);
-  })
-  .catch(async (err) => {
-    console.warn('\n⚠️  KONEKSI DATABASE ATLAS GAGAL! ⚠️');
-    console.warn('Alasan:', err.message);
-    console.warn('💡 Sistem otomatis beralih ke Mode Database Lokal (db_fallback.json)!\n');
-    useLocalFallback = true;
-    await seedData(true);
-  });
-
-// ==========================================
-// DYNAMIC MOCK DATA SEEDER
-// ==========================================
-const seedData = async (isLocal) => {
-  try {
-    const arCount = isLocal ? (await localDb.find('ar')).length : await AR.countDocuments();
-    const apCount = isLocal ? (await localDb.find('ap')).length : await AP.countDocuments();
-    const pymhdCount = isLocal ? (await localDb.find('pymhd')).length : await PYMHD.countDocuments();
-    const umoCount = isLocal ? (await localDb.find('umo')).length : await UMO.countDocuments();
-
-    if (arCount === 0 && apCount === 0 && pymhdCount === 0 && umoCount === 0) {
-      console.log('Database kosong. Memulai seeding data contoh keuangan... 🌱');
-
-      const getPastDate = (monthsAgo, day = 15) => {
-        const d = new Date();
-        d.setMonth(d.getMonth() - monthsAgo);
-        d.setDate(day);
-        d.setHours(0, 0, 0, 0);
-        return d;
-      };
-
-      const arMock = [
-        { invoiceNo: 'INV/2026/001', customerName: 'PT Harapan Jaya Logistik', invoiceDate: getPastDate(4, 10), dueDate: getPastDate(3, 10), amount: 150000000, paidAmount: 150000000, notes: 'Lunas tepat waktu' },
-        { invoiceNo: 'INV/2026/002', customerName: 'PT Semesta Distribusi', invoiceDate: getPastDate(3, 15), dueDate: getPastDate(2, 15), amount: 280000000, paidAmount: 200000000, notes: 'Cicilan ke-1 selesai' },
-        { invoiceNo: 'INV/2026/003', customerName: 'CV Samudra Abadi', invoiceDate: getPastDate(2, 5), dueDate: getPastDate(1, 5), amount: 95000000, paidAmount: 0, notes: 'Invoice dikirim via email' },
-        { invoiceNo: 'INV/2026/004', customerName: 'PT Sinergi Bangun Bangsa', invoiceDate: getPastDate(1, 20), dueDate: getPastDate(0, 20), amount: 420000000, paidAmount: 120000000, notes: 'Pembayaran sebagian' },
-        { invoiceNo: 'INV/2026/005', customerName: 'PT Nusantara Cargo', invoiceDate: getPastDate(0, 5), dueDate: getPastDate(-1, 5), amount: 180000000, paidAmount: 0, notes: 'Belum jatuh tempo' },
-        { invoiceNo: 'INV/2026/006', customerName: 'CV Multi Niaga', invoiceDate: getPastDate(5, 12), dueDate: getPastDate(4, 12), amount: 62000000, paidAmount: 62000000, notes: 'Pembayaran penuh' }
-      ];
-
-      const apMock = [
-        { invoiceNo: 'AP/VND/2026/012', supplierName: 'PT Pertamina Patra Niaga', invoiceDate: getPastDate(4, 8), dueDate: getPastDate(3, 8), amount: 90000000, paidAmount: 90000000, notes: 'Bahan bakar armada' },
-        { invoiceNo: 'AP/VND/2026/013', supplierName: 'CV Global Sparepart', invoiceDate: getPastDate(3, 22), dueDate: getPastDate(2, 22), amount: 45000000, paidAmount: 45000000, notes: 'Suku cadang truk logistik' },
-        { invoiceNo: 'AP/VND/2026/014', supplierName: 'PT Jasa Marga Persero', invoiceDate: getPastDate(2, 10), dueDate: getPastDate(1, 10), amount: 120000000, paidAmount: 80000000, notes: 'Langganan e-toll armada' },
-        { invoiceNo: 'AP/VND/2026/015', supplierName: 'PT Telekomunikasi Indonesia', invoiceDate: getPastDate(1, 18), dueDate: getPastDate(0, 18), amount: 35000000, paidAmount: 0, notes: 'Tagihan internet & telepon kantor' },
-        { invoiceNo: 'AP/VND/2026/016', supplierName: 'CV Bintang Logistik', invoiceDate: getPastDate(0, 1), dueDate: getPastDate(-1, 1), amount: 155000000, paidAmount: 0, notes: 'Sewa gudang tambahan' }
-      ];
-
-      const pymhdMock = [
-        { referenceNo: 'PYMHD/2026/05/01', expenseCategory: 'Beban Gaji Karyawan', vendorName: 'Divisi SDM & Payroll', period: 'Mei 2026', amount: 320000000, status: 'Accrued', notes: 'Gaji bulan berjalan belum ditransfer' },
-        { referenceNo: 'PYMHD/2026/05/02', expenseCategory: 'Beban Sewa Gudang', vendorName: 'PT Agung Podomoro', period: 'Mei 2026', amount: 80000000, status: 'Accrued', notes: 'Sewa gudang Blok C' },
-        { referenceNo: 'PYMHD/2026/04/01', expenseCategory: 'Beban Listrik & Air', vendorName: 'PT PLN & PDAM', period: 'April 2026', amount: 24000000, status: 'Paid', notes: 'Sudah didebit otomatis' },
-        { referenceNo: 'PYMHD/2026/04/02', expenseCategory: 'Beban Jasa Konsultan', vendorName: 'KPMG Indonesia', period: 'April 2026', amount: 150000000, status: 'Accrued', notes: 'Jasa audit keuangan Q1' }
-      ];
-
-      const umoMock = [
-        { umoNo: 'UMO/OPS/2026/045', employeeName: 'Budi Santoso', requestDate: getPastDate(1, 5), description: 'Uang muka operasional pengiriman barang rute Jakarta-Surabaya', amount: 7500000, realizedAmount: 6800000, notes: 'Sisa Rp 700.000 sudah dikembalikan' },
-        { umoNo: 'UMO/OPS/2026/048', employeeName: 'Eka Saputra', requestDate: getPastDate(0, 10), description: 'Biaya perjalanan dinas survei lokasi gudang baru di Semarang', amount: 5000000, realizedAmount: 0, notes: 'Masih dalam perjalanan dinas' },
-        { umoNo: 'UMO/OPS/2026/049', employeeName: 'Rian Hidayat', requestDate: getPastDate(0, 18), description: 'Uang saku sopir kontainer rute Merak-Bakauheni', amount: 3500000, realizedAmount: 3200000, notes: 'Dalam proses settlement dokumen' }
-      ];
-
-      if (isLocal) {
-        for (let item of arMock) await localDb.create('ar', item);
-        for (let item of apMock) await localDb.create('ap', item);
-        for (let item of pymhdMock) await localDb.create('pymhd', item);
-        for (let item of umoMock) await localDb.create('umo', item);
-      } else {
-        await AR.insertMany(arMock);
-        await AP.insertMany(apMock);
-        await PYMHD.insertMany(pymhdMock);
-        await UMO.insertMany(umoMock);
-      }
-
-      console.log('Seeding data keuangan BERHASIL! 🍃');
-    }
-  } catch (err) {
-    console.error('Gagal melakukan seeding data:', err);
+async function seedDefaults() {
+  // Seed default users
+  const userCount = await User.countDocuments();
+  if (userCount === 0) {
+    await User.insertMany([
+      { username: "admin", password: "admin123", role: "admin" },
+      { username: "postal", password: "mirasenja", role: "viewer" },
+    ]);
+    console.log("✅ Default users seeded");
   }
-};
 
-// Helper model retriever
-const getModel = (menu) => {
-  const map = { 'ar': AR, 'ap': AP, 'pymhd': PYMHD, 'umo': UMO };
-  return map[menu.toLowerCase()];
-};
+  // Seed default SLA data
+  const slaCount = await SlaData.countDocuments();
+  if (slaCount === 0) {
+    const now = new Date().toISOString();
+    const week = getWeekRange("2026-04-14");
+    await SlaData.insertMany([
+      {
+        tanggal: "2026-04-14",
+        rute: "Rute 1: JAT - Surabaya",
+        titik: [
+          { label: "JAT (OUT)", realisasi: null, target: "08:00" },
+          { label: "Surabaya (IN)", realisasi: null, target: "22:00" },
+        ],
+        category: "primer",
+        ...week,
+        uploadTime: now,
+      },
+      {
+        tanggal: "2026-04-14",
+        rute: "Rute 2: JAT - Yogyakarta",
+        titik: [
+          { label: "JAT (OUT)", realisasi: null, target: "07:00" },
+          { label: "Yogyakarta (IN)", realisasi: null, target: "14:00" },
+        ],
+        category: "primer",
+        ...week,
+        uploadTime: now,
+      },
+      {
+        tanggal: "2026-04-14",
+        rute: "Rute 3: JAT - Medan",
+        titik: [
+          { label: "JAT (OUT)", realisasi: null, target: "06:00" },
+          { label: "Medan (IN)", realisasi: null, target: "18:00" },
+        ],
+        category: "primer",
+        ...week,
+        uploadTime: now,
+      },
+      {
+        tanggal: "2026-04-14",
+        rute: "Rute 4: JAT - Purwokerto",
+        titik: [
+          { label: "JAT (OUT)", realisasi: null, target: "06:00" },
+          { label: "Purwokerto (IN)", realisasi: null, target: "12:00" },
+        ],
+        category: "primer",
+        ...week,
+        uploadTime: now,
+      },
+    ]);
+    console.log("✅ Default SLA data seeded");
+  }
+}
 
-// ==========================================
-// 1. DASHBOARD SUMMARY ENDPOINT
-// ==========================================
-app.get('/api/dashboard/summary', async (req, res) => {
+// ─── Helper Functions ─────────────────────────────────────────────────────────
+
+function formatExcelTime(value) {
+  if (value == null || value === "") return "-";
+  if (typeof value === "number") {
+    if (value < 1) {
+      const totalSeconds = Math.round(value * 24 * 3600);
+      const h = Math.floor(totalSeconds / 3600);
+      const m = Math.floor((totalSeconds % 3600) / 60);
+      return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    }
+    const s = String(value);
+    if (s.length === 3) return `0${s[0]}:${s.substring(1)}`;
+    if (s.length === 4) return `${s.substring(0, 2)}:${s.substring(2)}`;
+  }
+  return String(value).trim();
+}
+
+function parseIndoNumber(val) {
+  if (val == null || val === "") return 0;
+  if (typeof val === "number") return val;
+  let s = String(val).trim().replace(/\s/g, "");
+  if (s.includes(",") && !s.includes(".")) {
+    s = s.replace(",", ".");
+  } else if (s.includes(",") && s.includes(".")) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  }
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+function parseDate(dateValue) {
+  if (!dateValue) return null;
+  if (typeof dateValue === "number") {
+    const d = new Date(Math.round((dateValue - 25569) * 86400 * 1000));
+    if (!isNaN(d.getTime())) return d.toISOString().split("T")[0];
+  }
+  if (dateValue instanceof Date) {
+    if (!isNaN(dateValue.getTime())) {
+      const offset = dateValue.getTimezoneOffset() * 60000;
+      return new Date(dateValue.getTime() - offset).toISOString().split("T")[0];
+    }
+  }
+  if (typeof dateValue === "string") {
+    const s = dateValue.trim();
+    if (!s) return null;
+    const ddMmYyyyMatch = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})$/);
+    if (ddMmYyyyMatch) {
+      let day = ddMmYyyyMatch[1].padStart(2, "0");
+      let month = ddMmYyyyMatch[2].padStart(2, "0");
+      let year = ddMmYyyyMatch[3];
+      if (year.length === 2) year = "20" + year;
+      return `${year}-${month}-${day}`;
+    }
+    const yyyyMmDdMatch = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+    if (yyyyMmDdMatch) {
+      return `${yyyyMmDdMatch[1]}-${yyyyMmDdMatch[2].padStart(2, "0")}-${yyyyMmDdMatch[3].padStart(2, "0")}`;
+    }
+    const months = {
+      januari: 1,
+      january: 1,
+      jan: 1,
+      februari: 2,
+      february: 2,
+      feb: 2,
+      maret: 3,
+      march: 3,
+      mar: 3,
+      april: 4,
+      apr: 4,
+      mei: 5,
+      may: 5,
+      juni: 6,
+      june: 6,
+      jun: 6,
+      juli: 7,
+      july: 7,
+      jul: 7,
+      agustus: 8,
+      august: 8,
+      aug: 8,
+      september: 9,
+      sep: 9,
+      oktober: 10,
+      october: 10,
+      okt: 10,
+      november: 11,
+      nov: 11,
+      desember: 12,
+      december: 12,
+      des: 12,
+    };
+    const namedDateMatch = s.match(
+      /^(\d{1,2})[\s-/]+([A-Za-z]+)[\s-/]+(\d{2,4})$/,
+    );
+    if (namedDateMatch) {
+      const day = namedDateMatch[1].padStart(2, "0");
+      const monthName = namedDateMatch[2].toLowerCase();
+      let year = namedDateMatch[3];
+      if (year.length === 2) year = "20" + year;
+      const monthNum = months[monthName];
+      if (monthNum)
+        return `${year}-${monthNum.toString().padStart(2, "0")}-${day}`;
+    }
+    const parsedDate = new Date(s);
+    if (!isNaN(parsedDate.getTime())) {
+      const offset = parsedDate.getTimezoneOffset() * 60000;
+      return new Date(parsedDate.getTime() - offset)
+        .toISOString()
+        .split("T")[0];
+    }
+  }
+  return null;
+}
+
+function getWeekRange(dateStr) {
+  const date = new Date(dateStr + "T00:00:00Z");
+  const day = date.getUTCDay();
+  const diff = (day === 0 ? -6 : 1) - day;
+  const monday = new Date(date.getTime() + diff * 86400000);
+  const sunday = new Date(monday.getTime() + 6 * 86400000);
+  const mondayStr = monday.toISOString().split("T")[0];
+  const sundayStr = sunday.toISOString().split("T")[0];
+  return {
+    startDate: mondayStr,
+    endDate: sundayStr,
+    weekKey: `${mondayStr}_${sundayStr}`,
+  };
+}
+
+// ─── Configure multer ─────────────────────────────────────────────────────────
+
+const upload = multer({ dest: "/tmp" });
+
+// ─── DB Connection Middleware (harus setelah model didefinisikan) ─────────────
+// Pastikan DB terkoneksi tiap request (penting untuk Vercel serverless)
+app.use(async (req, res, next) => {
   try {
-    let arData, apData, pymhdData, umoData;
+    await connectDB();
+    next();
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Gagal konek ke database: ' + err.message });
+  }
+});
 
-    if (useLocalFallback) {
-      arData = await localDb.find('ar');
-      apData = await localDb.find('ap');
-      pymhdData = await localDb.find('pymhd');
-      umoData = await localDb.find('umo');
-    } else {
-      arData = await AR.find();
-      apData = await AP.find();
-      pymhdData = await PYMHD.find();
-      umoData = await UMO.find();
-    }
+// ─── API Routes ───────────────────────────────────────────────────────────────
 
-    // 1. AR Calculations
-    let arTotal = 0, arOutstanding = 0, arPaid = 0, arOverdue = 0;
-    arData.forEach(item => {
-      arTotal += item.amount || 0;
-      arPaid += item.paidAmount || 0;
-      arOutstanding += item.balance || 0;
-      if (item.status === 'Overdue') arOverdue += item.balance || 0;
+// Login
+app.post("/api/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await User.findOne({
+      username: { $regex: new RegExp(`^${username}$`, "i") },
+      password,
     });
-
-    // 2. AP Calculations
-    let apTotal = 0, apUnpaid = 0, apPaid = 0, apOverdue = 0;
-    apData.forEach(item => {
-      apTotal += item.amount || 0;
-      apPaid += item.paidAmount || 0;
-      apUnpaid += item.balance || 0;
-      if (item.status === 'Overdue') apOverdue += item.balance || 0;
+    if (!user)
+      return res
+        .status(401)
+        .json({ success: false, message: "Username atau password salah" });
+    res.json({
+      success: true,
+      message: "Login berhasil",
+      user: { id: user._id, username: user.username, role: user.role },
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+// Upload Volume Excel
+app.post("/api/upload", upload.single("file"), async (req, res) => {
+  try {
+    const { category, weekStart } = req.body;
+    const file = req.file;
+    if (!file)
+      return res
+        .status(400)
+        .json({ success: false, message: "File tidak ditemukan" });
 
-    // 3. PYMHD Calculations
-    let pymhdTotal = 0, pymhdAccrued = 0, pymhdPaid = 0;
-    pymhdData.forEach(item => {
-      pymhdTotal += item.amount || 0;
-      if (item.status === 'Accrued') pymhdAccrued += item.amount || 0;
-      if (item.status === 'Paid') pymhdPaid += item.amount || 0;
+    const workbook = xlsx.readFile(file.path);
+    const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+    const allRows = xlsx.utils.sheet_to_json(worksheet, {
+      header: 1,
+      raw: true,
     });
+    if (allRows.length === 0)
+      return res.status(400).json({ success: false, message: "File kosong" });
 
-    // 4. UMO Calculations
-    let umoTotal = 0, umoOpen = 0, umoSettled = 0;
-    umoData.forEach(item => {
-      umoTotal += item.amount || 0;
-      umoOpen += item.settlementBalance || 0;
-      umoSettled += item.realizedAmount || 0;
-    });
-
-    // 5. Monthly trend analysis (combining all)
-    const monthlyTrends = {};
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
-    
-    // Initialise last 6 months
-    const today = new Date();
-    for (let i = 5; i >= 0; i--) {
-      const d = new Date(today.getFullYear(), today.getMonth() - i, 1);
-      const label = `${months[d.getMonth()]} ${d.getFullYear().toString().substring(2)}`;
-      monthlyTrends[label] = { label, ar: 0, ap: 0, pymhd: 0, umo: 0 };
-    }
-
-    const addToTrend = (date, amount, type) => {
-      if (!date) return;
-      const d = new Date(date);
-      const label = `${months[d.getMonth()]} ${d.getFullYear().toString().substring(2)}`;
-      if (monthlyTrends[label]) {
-        monthlyTrends[label][type] += amount;
-      }
+    let headerRowIdx = -1;
+    let colMap = {
+      rute: -1,
+      tanggal: -1,
+      postal: -1,
+      poslog: -1,
+      kapasitas: -1,
+      unit: -1,
     };
 
-    arData.forEach(item => addToTrend(item.invoiceDate, item.amount, 'ar'));
-    apData.forEach(item => addToTrend(item.invoiceDate, item.amount, 'ap'));
-    umoData.forEach(item => addToTrend(item.requestDate, item.amount, 'umo'));
-    
-    // PYMHD has period or createdAt
-    pymhdData.forEach(item => {
-      if (item.createdAt) addToTrend(item.createdAt, item.amount, 'pymhd');
-    });
+    for (let i = 0; i < Math.min(allRows.length, 20); i++) {
+      const row = allRows[i];
+      if (!row || !Array.isArray(row)) continue;
+      const findCol = (terms) =>
+        row.findIndex(
+          (c) =>
+            c &&
+            terms.some((t) =>
+              String(c).toLowerCase().includes(t.toLowerCase()),
+            ),
+        );
+      const r = findCol(["nama rute", "rute"]);
+      const t = findCol(["attribute", "tanggal", "date", "tgl"]);
+      const p = findCol(["posta", "postal"]);
+      if (r !== -1 && (t !== -1 || p !== -1)) {
+        headerRowIdx = i;
+        colMap.rute = r;
+        colMap.tanggal = t;
+        colMap.postal = p;
+        colMap.poslog = findCol(["poslog", "non postal", "non_postal"]);
+        colMap.kapasitas = findCol(["kapasit", "kapasitas", "capacity"]);
+        // Detect column indices including more variations for Unit
+        colMap.unit = findCol(["unit", "satuan", "unit (kg)", "unit (kg.)", "unit (kg)", "unit (Kg)", "unit-kg", "unit_kg", "unitkg", "unitkg."]);
+        // Fallback: if still not found, look for any header containing the word "unit" ignoring case and extra characters
+        if (colMap.unit === -1 && headerRowIdx !== -1) {
+          const headerRow = allRows[headerRowIdx];
+          for (let idx = 0; idx < headerRow.length; idx++) {
+            const cell = headerRow[idx];
+            if (cell && String(cell).toLowerCase().includes('unit')) {
+              colMap.unit = idx;
+              break;
+            }
+          }
+        }
+        colMap.space = findCol(["space", "sisa"]);
+        break;
+      }
+    }
+
+    if (headerRowIdx === -1) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Format kolom tidak dikenali. Pastikan ada kolom "Nama Rute" dan "Attribute" atau "Postal".',
+      });
+    }
+
+    let successCount = 0,
+      errorCount = 0,
+      usedWeekRange = null;
+    const records = [];
+
+    for (let i = headerRowIdx + 1; i < allRows.length; i++) {
+      const row = allRows[i];
+      if (!row || row.length === 0) continue;
+      try {
+        if (i <= headerRowIdx + 100) {
+          row.forEach((cell, idx) => {
+            if (cell == null) return;
+            const str = String(cell).trim();
+            if (colMap.tanggal === -1) {
+              if (typeof cell === "number" && cell > 40000 && cell < 60000)
+                colMap.tanggal = idx;
+              else if (str.match(/^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$/))
+                colMap.tanggal = idx;
+              else if (str.match(/^\d{4}[-/]\d{1,2}[-/]\d{1,2}$/))
+                colMap.tanggal = idx;
+            }
+            if (
+              colMap.rute === -1 &&
+              typeof cell === "string" &&
+              str.length > 5
+            )
+              colMap.rute = idx;
+            if (colMap.postal === -1 && typeof cell === "number" && cell > 0)
+              colMap.postal = idx;
+          });
+        }
+
+        const routeName =
+          colMap.rute !== -1 ? String(row[colMap.rute] || "").trim() : "";
+        if (!routeName) continue;
+
+        let recordDate =
+          colMap.tanggal !== -1 && row[colMap.tanggal]
+            ? parseDate(row[colMap.tanggal])
+            : null;
+        if (!recordDate && weekStart) recordDate = weekStart;
+        if (!recordDate) recordDate = new Date().toISOString().split("T")[0];
+
+        const weekRange = getWeekRange(recordDate);
+        if (!usedWeekRange) usedWeekRange = weekRange.weekKey;
+
+        const postalVolume =
+          colMap.postal !== -1 ? parseIndoNumber(row[colMap.postal]) : 0;
+        const nonPostalVolume =
+          colMap.poslog !== -1 ? parseIndoNumber(row[colMap.poslog]) : 0;
+        const kapasitas =
+          colMap.kapasitas !== -1 ? parseIndoNumber(row[colMap.kapasitas]) : 0;
+        const unitValue = colMap.unit !== -1 ? String(row[colMap.unit] || "").trim() : "";
+
+        let spaceAvailable = 0;
+        if (colMap.space !== -1 && row[colMap.space] != null) {
+          const rawSpace = row[colMap.space];
+          spaceAvailable =
+            typeof rawSpace === "number"
+              ? rawSpace <= 1
+                ? rawSpace
+                : rawSpace / 100
+              : parseIndoNumber(String(rawSpace).replace("%", "").trim()) / 100;
+        } else if (kapasitas > 0) {
+          spaceAvailable = 1 - (postalVolume + nonPostalVolume) / kapasitas;
+        }
+
+        records.push({
+          tanggal: recordDate,
+          rute: routeName,
+          postal: postalVolume,
+          nonPostal: nonPostalVolume,
+          kapasitas,
+          sisa: spaceAvailable,
+          category: category || "primer",
+          weekStart: weekRange.startDate,
+          weekEnd: weekRange.endDate,
+          weekKey: weekRange.weekKey,
+          unit: unitValue ? [unitValue] : [],
+        });
+        successCount++;
+      } catch (err) {
+        console.error("Error processing row:", err);
+        errorCount++;
+      }
+    }
+
+    if (records.length > 0) await VolumeData.insertMany(records);
+    try {
+      fs.unlinkSync(file.path);
+    } catch (e) {}
 
     res.json({
-      ar: { total: arTotal, outstanding: arOutstanding, paid: arPaid, overdue: arOverdue, count: arData.length },
-      ap: { total: apTotal, unpaid: apUnpaid, paid: apPaid, overdue: apOverdue, count: apData.length },
-      pymhd: { total: pymhdTotal, accrued: pymhdAccrued, paid: pymhdPaid, count: pymhdData.length },
-      umo: { total: umoTotal, open: umoOpen, settled: umoSettled, count: umoData.length },
-      trends: Object.values(monthlyTrends)
+      success: true,
+      message: `Data berhasil diupload: ${successCount} rute berhasil`,
+      successCount,
+      errorCount,
+      weekRange: usedWeekRange,
     });
-  } catch (err) {
-    res.status(500).json({ error: 'Gagal mengambil ringkasan dashboard: ' + err.message });
+  } catch (error) {
+    console.error("Upload error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error processing file: " + error.message,
+    });
   }
 });
 
-// ==========================================
-// 2. CRUD ENDPOINTS
-// ==========================================
-
-// Get all
-app.get('/api/:menu', async (req, res) => {
-  const menu = req.params.menu.toLowerCase();
-  
-  if (useLocalFallback) {
-    try {
-      const list = await localDb.find(menu);
-      return res.json(list);
-    } catch(err) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
-
-  const Model = getModel(menu);
-  if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
-
+// Upload SLA Excel
+app.post("/api/upload-sla", upload.single("file"), async (req, res) => {
+  console.log("\n=== SLA UPLOAD PROCESS START ===");
   try {
-    const data = await Model.find().sort({ createdAt: -1 });
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: 'Gagal mengambil data: ' + err.message });
-  }
-});
+    const { category, weekStart } = req.body;
+    const file = req.file;
+    if (!file)
+      return res
+        .status(400)
+        .json({ success: false, message: "File tidak ditemukan" });
 
-// Create one
-app.post('/api/:menu', async (req, res) => {
-  const menu = req.params.menu.toLowerCase();
+    const workbook = xlsx.readFile(file.path);
+    const uploadDate = weekStart || new Date().toISOString().split("T")[0];
+    let successCount = 0;
 
-  if (useLocalFallback) {
-    try {
-      const record = await localDb.create(menu, req.body);
-      return res.status(201).json(record);
-    } catch (err) {
-      if (err.code === 11000) {
-        return res.status(400).json({ error: 'Nomor Dokumen / Invoice sudah terdaftar di database.' });
-      }
-      return res.status(500).json({ error: err.message });
-    }
-  }
-
-  const Model = getModel(menu);
-  if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
-
-  try {
-    const newRecord = new Model(req.body);
-    await newRecord.save();
-    res.status(201).json(newRecord);
-  } catch (err) {
-    if (err.code === 11000) {
-      return res.status(400).json({ error: 'Nomor Dokumen / Invoice sudah terdaftar di database.' });
-    }
-    res.status(500).json({ error: 'Gagal menambahkan data: ' + err.message });
-  }
-});
-
-// SMART UPSERT BULK IMPORT
-app.post('/api/:menu/bulk', async (req, res) => {
-  const menu = req.params.menu.toLowerCase();
-  const records = req.body;
-  if (!Array.isArray(records) || records.length === 0) {
-    return res.status(400).json({ error: 'Format data tidak valid.' });
-  }
-
-  if (useLocalFallback) {
-    try {
-      const stats = await localDb.insertMany(menu, records);
-      return res.status(201).json({
-        message: `Sinkronisasi Excel selesai di Database Lokal. ${stats.insertedCount} data baru ditambahkan, ${stats.updatedCount} data tagihan/pembayaran diperbarui!`,
-        insertedCount: stats.insertedCount,
-        updatedCount: stats.updatedCount
+    let rows = [];
+    for (const name of workbook.SheetNames) {
+      const currentRows = xlsx.utils.sheet_to_json(workbook.Sheets[name], {
+        header: 1,
       });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
+      if (currentRows.length > 5) {
+        rows = currentRows;
+        break;
+      }
     }
+    if (rows.length === 0)
+      rows = xlsx.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {
+        header: 1,
+      });
+
+    let headerRowIdx = -1;
+    let colMap = {
+      nopol: -1,
+      rute: -1,
+      kota: -1,
+      tgl: -1,
+      target: -1,
+      realisasi: -1,
+      status: -1,
+    };
+    for (let i = 0; i < Math.min(rows.length, 50); i++) {
+      const row = rows[i];
+      if (!row || !Array.isArray(row)) continue;
+      const f = (t) =>
+        row.findIndex(
+          (c) =>
+            c &&
+            t.some((x) => String(c).toLowerCase().includes(x.toLowerCase())),
+        );
+      const n = f(["nopol", "no pol"]);
+      const r = f(["rute", "route"]);
+      if (n !== -1 && r !== -1) {
+        headerRowIdx = i;
+        colMap = {
+          nopol: n,
+          rute: r,
+          kota: f(["kota", "lokasi"]),
+          tgl: f(["tgl", "tanggal"]),
+          target: f(["standar", "target"]),
+          realisasi: f(["aktual", "realisasi"]),
+          status: f(["status"]),
+        };
+        break;
+      }
+    }
+
+    if (headerRowIdx === -1) {
+      const preview = rows
+        .slice(0, 5)
+        .map((r) => JSON.stringify(r))
+        .join("\n");
+      return res.status(400).json({
+        success: false,
+        message: "Format tidak dikenali.\n" + preview,
+      });
+    }
+
+    const trips = {};
+    rows.slice(headerRowIdx + 1).forEach((row) => {
+      if (!row || row.length === 0) return;
+      const nopol =
+        colMap.nopol !== -1 ? String(row[colMap.nopol] || "").trim() : "";
+      const rute =
+        colMap.rute !== -1 ? String(row[colMap.rute] || "").trim() : "";
+      if (
+        !nopol ||
+        !rute ||
+        nopol.includes("|") ||
+        nopol.toLowerCase() === "nopol"
+      )
+        return;
+      const tgl = colMap.tgl !== -1 ? parseDate(row[colMap.tgl]) : uploadDate;
+      const key = `${nopol}_${rute}_${tgl}`;
+      if (!trips[key]) trips[key] = { nopol, rute, titik: [], tanggal: tgl };
+      trips[key].titik.push({
+        label:
+          colMap.kota !== -1
+            ? String(row[colMap.kota] || "Point").trim()
+            : "Point",
+        target:
+          colMap.target !== -1 ? formatExcelTime(row[colMap.target]) : "-",
+        realisasi:
+          colMap.realisasi !== -1
+            ? formatExcelTime(row[colMap.realisasi])
+            : "-",
+        status:
+          colMap.status !== -1 ? String(row[colMap.status] || "").trim() : "",
+      });
+    });
+
+    if (Object.keys(trips).length === 0)
+      return res
+        .status(400)
+        .json({ success: false, message: "Data tidak ditemukan." });
+
+    let minDate = null,
+      maxDate = null;
+    const slaRecords = [];
+    Object.values(trips).forEach((trip) => {
+      const week = getWeekRange(trip.tanggal);
+      if (!minDate || trip.tanggal < minDate) minDate = trip.tanggal;
+      if (!maxDate || trip.tanggal > maxDate) maxDate = trip.tanggal;
+      slaRecords.push({
+        ...trip,
+        category: category || "postal",
+        weekStart: week.startDate,
+        weekEnd: week.endDate,
+        weekKey: week.weekKey,
+        uploadTime: new Date().toISOString(),
+      });
+      successCount++;
+    });
+
+    await SlaData.insertMany(slaRecords);
+    try {
+      fs.unlinkSync(file.path);
+    } catch (e) {}
+    console.log(`=== SUCCESS: ${successCount} routes ===`);
+    res.json({
+      success: true,
+      message: `Upload berhasil: ${successCount} rute`,
+      minDate,
+      maxDate,
+    });
+  } catch (error) {
+    console.error("SLA Error:", error);
+    res.status(500).json({ success: false, message: error.message });
   }
+});
 
-  const Model = getModel(menu);
-  if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
-
-  const uniqueFields = { ar: 'invoiceNo', ap: 'invoiceNo', pymhd: 'referenceNo', umo: 'umoNo' };
-  const uniqKey = uniqueFields[menu];
-
+// Get available weeks
+app.get("/api/weeks", async (req, res) => {
   try {
-    // Generate high-performance bulk operations for Upserts
-    const bulkOps = records.map(item => {
-      // Clean and calculate balance / status in JS first
-      if (menu === 'ar') {
-        item.paidAmount = item.paidAmount || 0;
-        item.amount = item.amount || 0;
-        item.balance = item.amount - item.paidAmount;
-        if (item.balance <= 0) {
-          item.status = 'Paid';
-        } else {
-          const today = new Date();
-          today.setHours(0, 0, 0, 0);
-          const due = new Date(item.dueDate);
-          due.setHours(0, 0, 0, 0);
-          item.status = due < today ? 'Overdue' : 'Outstanding';
+    const { category } = req.query;
+    const query = category ? { category } : {};
+    const data = await VolumeData.find(
+      query,
+      "weekKey weekStart weekEnd",
+    ).lean();
+    const weekMap = {};
+    data.forEach((item) => {
+      if (!item.weekKey) return;
+      if (!weekMap[item.weekKey]) {
+        weekMap[item.weekKey] = {
+          weekKey: item.weekKey,
+          startDate: item.weekStart,
+          endDate: item.weekEnd,
+          recordCount: 0,
+        };
+      }
+      weekMap[item.weekKey].recordCount++;
+    });
+    const weeks = Object.values(weekMap).sort((a, b) =>
+      b.startDate.localeCompare(a.startDate),
+    );
+    res.json({ success: true, data: weeks });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Get volume data
+app.get("/api/volume", async (req, res) => {
+  try {
+    const { category, startDate, endDate, weekKey, aggregate, routeFilter } =
+      req.query;
+    const query = {};
+    if (category) query.category = category;
+    if (weekKey && weekKey !== "ALL" && weekKey !== "undefined")
+      query.weekKey = weekKey;
+    else if (!weekKey || weekKey !== "ALL") {
+      if (startDate && endDate)
+        query.tanggal = { $gte: startDate, $lte: endDate };
+    }
+    if (
+      routeFilter &&
+      routeFilter !== "" &&
+      routeFilter !== "undefined" &&
+      routeFilter !== "null" &&
+      routeFilter !== "Semua Rute"
+    ) {
+      query.rute = { $regex: new RegExp(`^${routeFilter}$`, "i") };
+    }
+
+    const filtered = await VolumeData.find(query).lean();
+
+    if (aggregate === "true") {
+      const routeMap = {};
+      filtered.forEach((item) => {
+        if (!routeMap[item.rute]) {
+          routeMap[item.rute] = {
+            rute: item.rute,
+            postal: 0,
+            nonPostal: 0,
+            kapasitas: 0,
+            sisa: 0,
+            count: 0,
+            tanggal: weekKey === "ALL" ? "SEMUA MINGGU" : weekKey || "Rekap",
+          };
         }
-      } else if (menu === 'ap') {
-        item.paidAmount = item.paidAmount || 0;
-        item.amount = item.amount || 0;
-        item.balance = item.amount - item.paidAmount;
-        if (item.balance <= 0) {
-          item.status = 'Paid';
-        } else {
-          const today = new Date();
-          today.setHours(0, 0, 0, 0);
-          const due = new Date(item.dueDate);
-          due.setHours(0, 0, 0, 0);
-          item.status = due < today ? 'Overdue' : 'Unpaid';
+        const dailyCapacity = (item.kapasitas || 0) / 7;
+        routeMap[item.rute].postal += item.postal || 0;
+        routeMap[item.rute].nonPostal += item.nonPostal || 0;
+        routeMap[item.rute].kapasitas += dailyCapacity;
+        routeMap[item.rute].sisa +=
+          dailyCapacity - (item.postal || 0) - (item.nonPostal || 0);
+        routeMap[item.rute].count++;
+      });
+      const aggregated = Object.values(routeMap).map((r) => ({
+        ...r,
+        sisa: r.kapasitas > 0 ? r.sisa / r.kapasitas : 0,
+      }));
+      let minDate = null,
+        maxDate = null;
+      filtered.forEach((item) => {
+        if (!minDate || item.tanggal < minDate) minDate = item.tanggal;
+        if (!maxDate || item.tanggal > maxDate) maxDate = item.tanggal;
+      });
+      return res.json({ success: true, data: aggregated, minDate, maxDate });
+    }
+
+    res.json({ success: true, data: filtered });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Get SLA data
+app.get("/api/sla", async (req, res) => {
+  try {
+    const { category, startDate, endDate, weekKey, aggregate, routeFilter } =
+      req.query;
+    const query = {};
+    if (category) query.category = category;
+    if (weekKey && weekKey !== "ALL" && weekKey !== "undefined")
+      query.weekKey = weekKey;
+    else if (!weekKey || weekKey !== "ALL") {
+      if (startDate && endDate)
+        query.tanggal = { $gte: startDate, $lte: endDate };
+    }
+    if (
+      routeFilter &&
+      routeFilter !== "" &&
+      routeFilter !== "undefined" &&
+      routeFilter !== "null" &&
+      routeFilter !== "Semua Rute"
+    ) {
+      query.rute = { $regex: new RegExp(`^${routeFilter}$`, "i") };
+    }
+
+    const filtered = await SlaData.find(query).lean();
+
+    if (aggregate === "true") {
+      const routeMap = {};
+      filtered.forEach((item) => {
+        if (!item || !item.rute) return;
+        if (!routeMap[item.rute]) {
+          routeMap[item.rute] = {
+            rute: item.rute,
+            nopol: item.nopol || "Multi",
+            tanggal: "Rekap",
+            titik: [],
+          };
         }
-      } else if (menu === 'pymhd') {
-        item.amount = item.amount || 0;
-        item.status = item.status || 'Accrued';
-      } else if (menu === 'umo') {
-        item.amount = item.amount || 0;
-        item.realizedAmount = item.realizedAmount || 0;
-        item.settlementBalance = item.amount - item.realizedAmount;
-        item.status = item.settlementBalance <= 0 ? 'Settled' : 'Open';
+        if (item.titik) {
+          item.titik.forEach((t, idx) => {
+            if (!routeMap[item.rute].titik[idx]) {
+              routeMap[item.rute].titik[idx] = {
+                label: t.label,
+                target: t.target,
+                totalMinutes: 0,
+                count: 0,
+                status: "On-Time",
+              };
+            }
+            if (t.realisasi && t.realisasi !== "-") {
+              const parts = t.realisasi.split(":");
+              if (parts.length === 2) {
+                const mins = parseInt(parts[0]) * 60 + parseInt(parts[1]);
+                routeMap[item.rute].titik[idx].totalMinutes += mins;
+                routeMap[item.rute].titik[idx].count++;
+                if (
+                  t.status &&
+                  (t.status.toLowerCase().includes("terlambat") ||
+                    t.status.toLowerCase().includes("delay"))
+                ) {
+                  routeMap[item.rute].titik[idx].status = "Delay";
+                }
+              }
+            }
+          });
+        }
+      });
+      let minDate = null,
+        maxDate = null;
+      filtered.forEach((item) => {
+        if (item && item.tanggal) {
+          if (!minDate || item.tanggal < minDate) minDate = item.tanggal;
+          if (!maxDate || item.tanggal > maxDate) maxDate = item.tanggal;
+        }
+      });
+      return res.json({
+        success: true,
+        data: Object.values(routeMap),
+        minDate,
+        maxDate,
+      });
+    }
+
+    res.json({ success: true, data: filtered });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Get routes (aggregated)
+app.get("/api/routes", async (req, res) => {
+  try {
+    const { category, startDate, endDate, weekKey, routeFilter } = req.query;
+    const query = {};
+    if (category) query.category = category;
+    if (
+      weekKey &&
+      weekKey !== "ALL" &&
+      weekKey !== "undefined" &&
+      weekKey !== "null"
+    )
+      query.weekKey = weekKey;
+    else if (!weekKey || weekKey !== "ALL") {
+      if (
+        startDate &&
+        endDate &&
+        startDate !== "undefined" &&
+        endDate !== "undefined"
+      ) {
+        query.tanggal = { $gte: startDate, $lte: endDate };
+      }
+    }
+    if (
+      routeFilter &&
+      routeFilter !== "" &&
+      routeFilter !== "undefined" &&
+      routeFilter !== "null" &&
+      routeFilter !== "Semua Rute"
+    ) {
+      query.rute = { $regex: new RegExp(`^${routeFilter}$`, "i") };
+    }
+
+    const filtered = await VolumeData.find(query).lean();
+    const routeMap = {};
+    filtered.forEach((item) => {
+      if (!item || !item.rute) return;
+      if (!routeMap[item.rute])
+        routeMap[item.rute] = {
+          route_name: item.rute,
+          postal_volume: 0,
+          non_postal_volume: 0,
+          kapasitas_total: 0,
+          space_sum: 0,
+          count: 0,
+          base_kapasitas: item.kapasitas || 0,
+          units: new Set()
+        };
+        
+      const dailyCapacity = (item.kapasitas || 0) / 7;
+      
+      if (item.kapasitas > routeMap[item.rute].base_kapasitas) {
+        routeMap[item.rute].base_kapasitas = item.kapasitas;
+      }
+      
+      if (Array.isArray(item.unit)) {
+        item.unit.forEach(u => {
+          if (u) routeMap[item.rute].units.add(u);
+        });
+      } else if (item.unit && typeof item.unit === 'string') {
+        routeMap[item.rute].units.add(item.unit);
       }
 
-      const filter = {};
-      filter[uniqKey] = item[uniqKey];
-
-      return {
-        updateOne: {
-          filter,
-          update: { $set: item },
-          upsert: true
-        }
-      };
+      routeMap[item.rute].postal_volume += item.postal || 0;
+      routeMap[item.rute].non_postal_volume += item.nonPostal || 0;
+      routeMap[item.rute].kapasitas_total += dailyCapacity;
+      routeMap[item.rute].space_sum +=
+        dailyCapacity - (item.postal || 0) - (item.nonPostal || 0);
+      routeMap[item.rute].count++;
     });
+    const routes = Object.values(routeMap).map((r) => ({
+      route_name: r.route_name,
+      postal_volume: r.postal_volume,
+      non_postal_volume: r.non_postal_volume,
+      kapasitas: r.kapasitas_total,
+      space_available: r.space_sum,
+      base_kapasitas: r.base_kapasitas,
+      units: Array.from(r.units).join(', ')
+    }));
+    let minDate = null,
+      maxDate = null;
+    filtered.forEach((item) => {
+      if (!minDate || item.tanggal < minDate) minDate = item.tanggal;
+      if (!maxDate || item.tanggal > maxDate) maxDate = item.tanggal;
+    });
+    res.json({ success: true, data: routes, minDate, maxDate });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
-    const result = await Model.bulkWrite(bulkOps);
-    
-    // bulkWrite response contains upsertedCount and modifiedCount
-    const inserted = result.upsertedCount || 0;
-    const updated = result.modifiedCount || 0;
+// Get statistics
+app.get("/api/stats", async (req, res) => {
+  try {
+    const { category, startDate, endDate, weekKey, routeFilter } = req.query;
+    const query = {};
+    if (category) query.category = category;
+    if (weekKey && weekKey !== "ALL" && weekKey !== "undefined")
+      query.weekKey = weekKey;
+    else if (!weekKey || weekKey !== "ALL") {
+      if (startDate && endDate)
+        query.tanggal = { $gte: startDate, $lte: endDate };
+    }
+    if (
+      routeFilter &&
+      routeFilter !== "" &&
+      routeFilter !== "undefined" &&
+      routeFilter !== "null" &&
+      routeFilter !== "Semua Rute"
+    ) {
+      query.rute = { $regex: new RegExp(`^${routeFilter}$`, "i") };
+    }
 
-    res.status(201).json({
-      message: `Sinkronisasi Excel selesai di MongoDB Atlas. ${inserted} data baru ditambahkan, ${updated} data pembayaran/tagihan diperbarui!`,
-      insertedCount: inserted,
-      updatedCount: updated
+    const filtered = await VolumeData.find(query).lean();
+    const uniqueRoutes = [
+      ...new Set(filtered.filter((r) => r && r.rute).map((r) => r.rute)),
+    ];
+    const postalVolume = filtered.reduce((sum, r) => sum + (r.postal || 0), 0);
+    const poslogVolume = filtered.reduce(
+      (sum, r) => sum + (r.nonPostal || 0),
+      0,
+    );
+    const totalCapacity = filtered.reduce(
+      (sum, r) => sum + (r.kapasitas || 0) / 7,
+      0,
+    );
+    const totalSisaKg = totalCapacity - postalVolume - poslogVolume;
+    const avgSpacePct =
+      totalCapacity > 0 ? (totalSisaKg / totalCapacity) * 100 : 0;
+    let minDate = null,
+      maxDate = null;
+    filtered.forEach((item) => {
+      if (!minDate || item.tanggal < minDate) minDate = item.tanggal;
+      if (!maxDate || item.tanggal > maxDate) maxDate = item.tanggal;
+    });
+    res.json({
+      success: true,
+      minDate,
+      maxDate,
+      data: {
+        total_routes: uniqueRoutes.length,
+        postal_volume: postalVolume,
+        poslog_volume: poslogVolume,
+        total_capacity: totalCapacity,
+        avg_space: avgSpacePct,
+      },
     });
   } catch (err) {
-    res.status(500).json({ error: 'Gagal menyinkronkan data Excel massal: ' + err.message });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Update one
-app.put('/api/:menu/:id', async (req, res) => {
-  const menu = req.params.menu.toLowerCase();
-  const id = req.params.id;
-
-  if (useLocalFallback) {
-    try {
-      const record = await localDb.findByIdAndUpdate(menu, id, req.body);
-      return res.json(record);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
-
-  const Model = getModel(menu);
-  if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
-
+// Delete SLA data by route name
+app.delete("/api/sla", async (req, res) => {
   try {
-    const record = await Model.findById(id);
-    if (!record) return res.status(404).json({ error: 'Data tidak ditemukan' });
-
-    Object.assign(record, req.body);
-    await record.save();
-
-    res.json(record);
-  } catch (err) {
-    res.status(500).json({ error: 'Gagal memperbarui data: ' + err.message });
-  }
-});
-
-// Delete one
-app.delete('/api/:menu/:id', async (req, res) => {
-  const menu = req.params.menu.toLowerCase();
-  const id = req.params.id;
-
-  if (useLocalFallback) {
-    try {
-      const deleted = await localDb.findByIdAndDelete(menu, id);
-      return res.json({ message: 'Data berhasil dihapus', id: deleted._id });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
+    const { routeName, routeNames } = req.body;
+    if (!routeName && (!routeNames || !Array.isArray(routeNames))) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Route name(s) is required" });
     }
-  }
-
-  const Model = getModel(menu);
-  if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
-
-  try {
-    const deleted = await Model.findByIdAndDelete(id);
-    if (!deleted) return res.status(404).json({ error: 'Data tidak ditemukan' });
-    res.json({ message: 'Data berhasil dihapus', id: id });
+    const targets = routeNames || [routeName];
+    const result = await SlaData.deleteMany({ rute: { $in: targets } });
+    if (result.deletedCount === 0)
+      return res
+        .status(404)
+        .json({ success: false, message: "No SLA data found for this route" });
+    res.json({
+      success: true,
+      message: `Successfully deleted ${result.deletedCount} SLA records`,
+    });
   } catch (err) {
-    res.status(500).json({ error: 'Gagal menghapus data: ' + err.message });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Clear all
-app.delete('/api/:menu', async (req, res) => {
-  const menu = req.params.menu.toLowerCase();
-
-  if (useLocalFallback) {
-    try {
-      const result = await localDb.deleteMany(menu);
-      return res.json({ message: `Berhasil membersihkan seluruh database untuk menu ${menu.toUpperCase()}`, count: result.deletedCount });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
+// Delete Volume data by route name
+app.delete("/api/volume", async (req, res) => {
+  try {
+    const { routeName, routeNames } = req.body;
+    if (!routeName && (!routeNames || !Array.isArray(routeNames))) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Route name(s) is required" });
     }
-  }
-
-  const Model = getModel(menu);
-  if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
-
-  try {
-    const result = await Model.deleteMany({});
-    res.json({ message: `Berhasil membersihkan seluruh database untuk menu ${menu.toUpperCase()}`, count: result.deletedCount });
+    const targets = routeNames || [routeName];
+    const result = await VolumeData.deleteMany({ rute: { $in: targets } });
+    if (result.deletedCount === 0)
+      return res.status(404).json({
+        success: false,
+        message: "No Volume data found for this route",
+      });
+    res.json({
+      success: true,
+      message: `Successfully deleted ${result.deletedCount} Volume records`,
+    });
   } catch (err) {
-    res.status(500).json({ error: 'Gagal membersihkan database: ' + err.message });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Catch-All Static Router
-app.get('/*path', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+// Update Volume data
+app.put("/api/volume", async (req, res) => {
+  try {
+    const { rute, postal, nonPostal, kapasitas, tanggal, id, unit } = req.body;
+    if (!rute && !id)
+      return res
+        .status(400)
+        .json({ success: false, message: "Rute or ID is required" });
+
+    // Jika id tersedia, update HANYA record itu saja (updateOne).
+    // Jika tidak ada id, fallback ke updateMany berdasarkan rute+tanggal.
+    const filter = id ? { _id: id } : { rute, ...(tanggal ? { tanggal } : {}) };
+    const doc = await VolumeData.findOne(filter);
+    if (!doc)
+      return res
+        .status(404)
+        .json({ success: false, message: "Data volume tidak ditemukan" });
+
+    const newPostal = postal !== undefined ? parseFloat(postal) : doc.postal;
+    const newNonPostal =
+      nonPostal !== undefined ? parseFloat(nonPostal) : doc.nonPostal;
+    const newKapasitas =
+      kapasitas !== undefined ? parseFloat(kapasitas) : doc.kapasitas;
+    const newSisa =
+      newKapasitas > 0
+        ? 1 - (newPostal + newNonPostal) / newKapasitas
+        : doc.sisa;
+
+    const updatePayload = {
+      $set: {
+        postal: newPostal,
+        nonPostal: newNonPostal,
+        kapasitas: newKapasitas,
+        sisa: newSisa,
+        // Update unit jika dikirim dalam request body
+        ...(unit !== undefined
+          ? { unit: Array.isArray(unit) ? unit : (unit === '' ? [] : [unit]) }
+          : {}),
+      },
+    };
+
+    // Gunakan updateOne jika ada id agar tidak menimpa semua baris rute yang sama
+    if (id) {
+      await VolumeData.updateOne(filter, updatePayload);
+    } else {
+      await VolumeData.updateMany(filter, updatePayload);
+    }
+
+    res.json({ success: true, message: "Data volume berhasil diperbarui" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server aktif di http://localhost:${PORT}`);
+// Update SLA data
+app.put("/api/sla", async (req, res) => {
+  try {
+    const { rute, titik, tanggal, id } = req.body;
+    if (!rute && !id)
+      return res
+        .status(400)
+        .json({ success: false, message: "Rute or ID is required" });
+    const filter = id ? { _id: id } : { rute, ...(tanggal ? { tanggal } : {}) };
+    const result = await SlaData.updateMany(filter, { $set: { titik } });
+    if (result.matchedCount === 0)
+      return res
+        .status(404)
+        .json({ success: false, message: "Data SLA tidak ditemukan" });
+    res.json({ success: true, message: "Data SLA berhasil diperbarui" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
+
+// Clear all data
+app.delete("/api/data/clear", async (req, res) => {
+  try {
+    await Promise.all([VolumeData.deleteMany({}), SlaData.deleteMany({})]);
+    res.json({ success: true, message: "All data cleared" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Serve frontend
+app.get("/", (req, res) =>
+  res.sendFile(path.join(__dirname, "dashboard-postal.html")),
+);
+app.get("/dashboard-postal.html", (req, res) =>
+  res.sendFile(path.join(__dirname, "dashboard-postal.html")),
+);
+app.get("/dashboard-chartbar.html", (req, res) =>
+  res.sendFile(path.join(__dirname, "dashboard-chartbar.html")),
+);
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+// Jalankan server lokal (diabaikan di Vercel karena NODE_ENV=production)
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Server aktif di http://localhost:${PORT}`);
+  });
+}
+
+// WAJIB untuk Vercel
+module.exports = app;
