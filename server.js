@@ -14,213 +14,29 @@ app.use(express.json());
 // Serve static frontend files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Flag to track database mode
-let useLocalFallback = false;
+// Flag MongoDB connection cache
+let isConnected = false;
 
-// ==========================================
-// FILE-BASED DATABASE FALLBACK ENGINE
-// ==========================================
-class LocalDb {
-  constructor() {
-    this.filePath = path.join(__dirname, 'db_fallback.json');
-    if (!fs.existsSync(this.filePath)) {
-      fs.writeFileSync(this.filePath, JSON.stringify({ ar: [], ap: [], pymhd: [], umo: [] }, null, 2));
-    }
-  }
-
-  read() {
-    try {
-      const content = fs.readFileSync(this.filePath, 'utf8');
-      return JSON.parse(content);
-    } catch (e) {
-      return { ar: [], ap: [], pymhd: [], umo: [] };
-    }
-  }
-
-  write(data) {
-    fs.writeFileSync(this.filePath, JSON.stringify(data, null, 2));
-  }
-
-  async find(collection) {
-    const db = this.read();
-    const list = db[collection.toLowerCase()] || [];
-    return [...list].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  }
-
-  async create(collection, item) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    if (!db[colName]) db[colName] = [];
-    
-    const record = {
-      _id: 'local_' + Math.random().toString(36).substring(2, 9),
-      ...item,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-
-    this.calculateFields(colName, record);
-
-    // Unique Constraint check for manual additions
-    const uniqueFields = { ar: 'invoiceNo', ap: 'invoiceNo', pymhd: 'referenceNo', umo: 'umoNo' };
-    const uniqKey = uniqueFields[colName];
-    if (uniqKey && db[colName].some(x => x[uniqKey] === record[uniqKey])) {
-      const err = new Error('Nomor Dokumen sudah terdaftar di database.');
-      err.code = 11000;
-      throw err;
-    }
-
-    db[colName].push(record);
-    this.write(db);
-    return record;
-  }
-
-  // SMART UPSERT FOR LOCAL DB
-  async insertMany(collection, items) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    if (!db[colName]) db[colName] = [];
-
-    const uniqueFields = { ar: 'invoiceNo', ap: 'invoiceNo', pymhd: 'referenceNo', umo: 'umoNo' };
-    const uniqKey = uniqueFields[colName];
-
-    let insertedCount = 0;
-    let updatedCount = 0;
-
-    for (let rawItem of items) {
-      this.calculateFields(colName, rawItem);
-      
-      const existingIdx = db[colName].findIndex(x => x[uniqKey] === rawItem[uniqKey]);
-      
-      if (existingIdx !== -1) {
-        // Update existing record
-        db[colName][existingIdx] = {
-          ...db[colName][existingIdx],
-          ...rawItem,
-          updatedAt: new Date().toISOString()
-        };
-        updatedCount++;
-      } else {
-        // Insert new record
-        const record = {
-          _id: 'local_' + Math.random().toString(36).substring(2, 9),
-          ...rawItem,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
-        db[colName].push(record);
-        insertedCount++;
-      }
-    }
-
-    this.write(db);
-    return { insertedCount, updatedCount };
-  }
-
-  async findByIdAndUpdate(collection, id, updateBody) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    const list = db[colName] || [];
-    const idx = list.findIndex(x => x._id === id);
-    if (idx === -1) throw new Error('Data tidak ditemukan');
-
-    const updated = {
-      ...list[idx],
-      ...updateBody,
-      updatedAt: new Date().toISOString()
-    };
-
-    this.calculateFields(colName, updated);
-    list[idx] = updated;
-    this.write(db);
-    return updated;
-  }
-
-  async findByIdAndDelete(collection, id) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    const list = db[colName] || [];
-    const idx = list.findIndex(x => x._id === id);
-    if (idx === -1) throw new Error('Data tidak ditemukan');
-
-    const deleted = list.splice(idx, 1)[0];
-    this.write(db);
-    return deleted;
-  }
-
-  async deleteMany(collection) {
-    const db = this.read();
-    const colName = collection.toLowerCase();
-    const count = db[colName] ? db[colName].length : 0;
-    db[colName] = [];
-    this.write(db);
-    return { deletedCount: count };
-  }
-
-  calculateFields(colName, record) {
-    if (colName === 'ar') {
-      record.paidAmount = record.paidAmount || 0;
-      record.amount = record.amount || 0;
-      record.balance = record.amount - record.paidAmount;
-      if (record.balance <= 0) {
-        record.status = 'Paid';
-      } else {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const due = new Date(record.dueDate);
-        due.setHours(0, 0, 0, 0);
-        record.status = due < today ? 'Overdue' : 'Outstanding';
-      }
-    } else if (colName === 'ap') {
-      record.paidAmount = record.paidAmount || 0;
-      record.amount = record.amount || 0;
-      record.balance = record.amount - record.paidAmount;
-      if (record.balance <= 0) {
-        record.status = 'Paid';
-      } else {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const due = new Date(record.dueDate);
-        due.setHours(0, 0, 0, 0);
-        record.status = due < today ? 'Overdue' : 'Unpaid';
-      }
-    } else if (colName === 'pymhd') {
-      record.amount = record.amount || 0;
-      record.status = record.status || 'Accrued';
-    } else if (colName === 'umo') {
-      record.amount = record.amount || 0;
-      record.realizedAmount = record.realizedAmount || 0;
-      record.settlementBalance = record.amount - record.realizedAmount;
-      record.status = record.settlementBalance <= 0 ? 'Settled' : 'Open';
-    }
-  }
-}
-
-const localDb = new LocalDb();
-
-// Connect to MongoDB Atlas with Automatic Local Fallback
-mongoose.connect(process.env.MONGO_URI)
-  .then(async () => {
-    console.log('Koneksi ke MongoDB Atlas BERHASIL! 🚀');
-    await seedData(false);
-  })
-  .catch(async (err) => {
-    console.warn('\n⚠️  KONEKSI DATABASE ATLAS GAGAL! ⚠️');
-    console.warn('Alasan:', err.message);
-    console.warn('💡 Sistem otomatis beralih ke Mode Database Lokal (db_fallback.json)!\n');
-    useLocalFallback = true;
-    await seedData(true);
+async function connectDB() {
+  if (isConnected && mongoose.connection.readyState === 1) return;
+  if (!process.env.MONGO_URI) throw new Error('MONGO_URI tidak ditemukan di Environment Variables!');
+  await mongoose.connect(process.env.MONGO_URI, {
+    serverSelectionTimeoutMS: 10000,
   });
+  isConnected = true;
+  console.log('Koneksi ke MongoDB Atlas BERHASIL! 🚀');
+  await seedData();
+}
 
 // ==========================================
 // DYNAMIC MOCK DATA SEEDER
 // ==========================================
-const seedData = async (isLocal) => {
+const seedData = async () => {
   try {
-    const arCount = isLocal ? (await localDb.find('ar')).length : await AR.countDocuments();
-    const apCount = isLocal ? (await localDb.find('ap')).length : await AP.countDocuments();
-    const pymhdCount = isLocal ? (await localDb.find('pymhd')).length : await PYMHD.countDocuments();
-    const umoCount = isLocal ? (await localDb.find('umo')).length : await UMO.countDocuments();
+    const arCount = await AR.countDocuments();
+    const apCount = await AP.countDocuments();
+    const pymhdCount = await PYMHD.countDocuments();
+    const umoCount = await UMO.countDocuments();
 
     if (arCount === 0 && apCount === 0 && pymhdCount === 0 && umoCount === 0) {
       console.log('Database kosong. Memulai seeding data contoh keuangan... 🌱');
@@ -263,17 +79,10 @@ const seedData = async (isLocal) => {
         { umoNo: 'UMO/OPS/2026/049', employeeName: 'Rian Hidayat', requestDate: getPastDate(0, 18), description: 'Uang saku sopir kontainer rute Merak-Bakauheni', amount: 3500000, realizedAmount: 3200000, notes: 'Dalam proses settlement dokumen' }
       ];
 
-      if (isLocal) {
-        for (let item of arMock) await localDb.create('ar', item);
-        for (let item of apMock) await localDb.create('ap', item);
-        for (let item of pymhdMock) await localDb.create('pymhd', item);
-        for (let item of umoMock) await localDb.create('umo', item);
-      } else {
-        await AR.insertMany(arMock);
-        await AP.insertMany(apMock);
-        await PYMHD.insertMany(pymhdMock);
-        await UMO.insertMany(umoMock);
-      }
+      await AR.insertMany(arMock);
+      await AP.insertMany(apMock);
+      await PYMHD.insertMany(pymhdMock);
+      await UMO.insertMany(umoMock);
 
       console.log('Seeding data keuangan BERHASIL! 🍃');
     }
@@ -295,17 +104,10 @@ app.get('/api/dashboard/summary', async (req, res) => {
   try {
     let arData, apData, pymhdData, umoData;
 
-    if (useLocalFallback) {
-      arData = await localDb.find('ar');
-      apData = await localDb.find('ap');
-      pymhdData = await localDb.find('pymhd');
-      umoData = await localDb.find('umo');
-    } else {
-      arData = await AR.find();
-      apData = await AP.find();
-      pymhdData = await PYMHD.find();
-      umoData = await UMO.find();
-    }
+    arData = await AR.find();
+    apData = await AP.find();
+    pymhdData = await PYMHD.find();
+    umoData = await UMO.find();
 
     // 1. AR Calculations
     let arTotal = 0, arOutstanding = 0, arPaid = 0, arOverdue = 0;
@@ -391,15 +193,6 @@ app.get('/api/dashboard/summary', async (req, res) => {
 app.get('/api/:menu', async (req, res) => {
   const menu = req.params.menu.toLowerCase();
   
-  if (useLocalFallback) {
-    try {
-      const list = await localDb.find(menu);
-      return res.json(list);
-    } catch(err) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
-
   const Model = getModel(menu);
   if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
 
@@ -414,18 +207,6 @@ app.get('/api/:menu', async (req, res) => {
 // Create one
 app.post('/api/:menu', async (req, res) => {
   const menu = req.params.menu.toLowerCase();
-
-  if (useLocalFallback) {
-    try {
-      const record = await localDb.create(menu, req.body);
-      return res.status(201).json(record);
-    } catch (err) {
-      if (err.code === 11000) {
-        return res.status(400).json({ error: 'Nomor Dokumen / Invoice sudah terdaftar di database.' });
-      }
-      return res.status(500).json({ error: err.message });
-    }
-  }
 
   const Model = getModel(menu);
   if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
@@ -448,19 +229,6 @@ app.post('/api/:menu/bulk', async (req, res) => {
   const records = req.body;
   if (!Array.isArray(records) || records.length === 0) {
     return res.status(400).json({ error: 'Format data tidak valid.' });
-  }
-
-  if (useLocalFallback) {
-    try {
-      const stats = await localDb.insertMany(menu, records);
-      return res.status(201).json({
-        message: `Sinkronisasi Excel selesai di Database Lokal. ${stats.insertedCount} data baru ditambahkan, ${stats.updatedCount} data tagihan/pembayaran diperbarui!`,
-        insertedCount: stats.insertedCount,
-        updatedCount: stats.updatedCount
-      });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
   }
 
   const Model = getModel(menu);
@@ -542,15 +310,6 @@ app.put('/api/:menu/:id', async (req, res) => {
   const menu = req.params.menu.toLowerCase();
   const id = req.params.id;
 
-  if (useLocalFallback) {
-    try {
-      const record = await localDb.findByIdAndUpdate(menu, id, req.body);
-      return res.json(record);
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
-
   const Model = getModel(menu);
   if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
 
@@ -572,15 +331,6 @@ app.delete('/api/:menu/:id', async (req, res) => {
   const menu = req.params.menu.toLowerCase();
   const id = req.params.id;
 
-  if (useLocalFallback) {
-    try {
-      const deleted = await localDb.findByIdAndDelete(menu, id);
-      return res.json({ message: 'Data berhasil dihapus', id: deleted._id });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
-
   const Model = getModel(menu);
   if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
 
@@ -596,15 +346,6 @@ app.delete('/api/:menu/:id', async (req, res) => {
 // Clear all
 app.delete('/api/:menu', async (req, res) => {
   const menu = req.params.menu.toLowerCase();
-
-  if (useLocalFallback) {
-    try {
-      const result = await localDb.deleteMany(menu);
-      return res.json({ message: `Berhasil membersihkan seluruh database untuk menu ${menu.toUpperCase()}`, count: result.deletedCount });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
 
   const Model = getModel(menu);
   if (!Model) return res.status(404).json({ error: 'Menu tidak ditemukan' });
@@ -622,6 +363,21 @@ app.get('/*path', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`Server aktif di http://localhost:${PORT}`);
+// Middleware: pastikan DB terkoneksi setiap request (penting untuk Vercel)
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'Gagal konek ke database: ' + err.message });
+  }
 });
+
+// Jalankan server lokal saja (Vercel tidak butuh ini)
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Server aktif di http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
